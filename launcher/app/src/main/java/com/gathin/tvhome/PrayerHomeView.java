@@ -238,6 +238,8 @@ public final class PrayerHomeView extends View {
             if (isha <= DAY_SECONDS) return x0;
             return nightX(now, isha - DAY_SECONDS, times[PRAYER_ROWS[0]], x0, x1);
         }
+        // Only called when hasNext is true and after the night cases above, so the next prayer is
+        // one of 1..4 here; the guard keeps next - 1 safe if that invariant ever changes.
         int next = data.nextIndex(now);
         if (next <= 0) return x0;
         long previous = times[PRAYER_ROWS[next - 1]];

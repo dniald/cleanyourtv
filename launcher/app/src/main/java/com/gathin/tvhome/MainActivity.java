@@ -202,6 +202,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private boolean prayerLoading;
     private long prayerLoadedAt;
     private ExecutorService prayerExecutor;
+    /** Retries a failed provider read a minute later; cancelled with the other ticks when Home pauses. */
+    private final Runnable prayerRetry = () -> loadPrayer(true);
     private boolean shamsi;
     /** greeting_name: said after the greeting, which is shown in capitals. */
     private String greetingName = "";
@@ -1045,12 +1047,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 prayerLoading = false;
                 if (isFinishing() || isDestroyed()) return;
                 if (data == null) {
-                    if (prayerData == null) prayerPanel.setVisibility(View.GONE);
-                    handler.postDelayed(() -> loadPrayer(true), 60_000L);
+                    if (prayerData == null && prayerPanel != null) prayerPanel.setVisibility(View.GONE);
+                    handler.removeCallbacks(prayerRetry);
+                    handler.postDelayed(prayerRetry, 60_000L);
                     return;
                 }
                 prayerData = data;
-                prayerLoadedAt = now;
+                prayerLoadedAt = System.currentTimeMillis();
                 quoteIndex = 0;
                 bindPrayer();
             });
@@ -1281,6 +1284,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         heroArt.animate().cancel();
         handler.removeCallbacks(minuteTick);
         handler.removeCallbacks(quoteTick);
+        handler.removeCallbacks(prayerRetry);
         stopStats();
         if (diya != null) diya.stop();
         cancelPendingFocusScroll();
@@ -1336,6 +1340,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     protected void onDestroy() {
         super.onDestroy();
         handler.removeCallbacks(quoteTick);
+        handler.removeCallbacks(prayerRetry);
         if (prayerExecutor != null) prayerExecutor.shutdownNow();
         unregisterReceiver(packageReceiver);
         wallpaperPlayer.close();
