@@ -68,6 +68,8 @@
         <!-- Coocaa OS sources for the Inputs menu (coocaa_sources); see CoocaaSources. -->
         <provider android:authorities="com.skyworth.tv.provider" />
         <provider android:authorities="com.skyworth.tv.sdk.provider" />
+        <!-- The Solat app's local prayer/quote provider (config.xml prayer_home). No INTERNET here. -->
+        <provider android:authorities="com.gathin.tv.solat.provider" />
     </queries>
 
     <application

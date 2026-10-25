@@ -90,6 +90,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * tvOS style home: black, a pinned dock row, an app grid, and one glass highlight that springs between tiles.
@@ -189,6 +191,17 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private TextView raceKicker, raceHeadline, raceSessions;
     /** config.xml show_stats, overridable by a theme. Off: the line is gone and nothing is read. */
     private boolean showStats;
+    /** config.xml / theme prayer_home: the WidgeTV prayer strip, fed by the Solat app's local provider. */
+    private boolean prayerHome;
+    private View prayerPanel;
+    private PrayerHomeView prayerTimeline;
+    private TextView prayerMeta, prayerZone, quoteText, quoteSource;
+    private PrayerSource.Data prayerData;
+    /** Which of the provider's quotes is on screen; the rotation moves it every 30 seconds. */
+    private int quoteIndex;
+    private boolean prayerLoading;
+    private long prayerLoadedAt;
+    private ExecutorService prayerExecutor;
     private boolean shamsi;
     /** greeting_name: said after the greeting, which is shown in capitals. */
     private String greetingName = "";
@@ -365,7 +378,24 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             if (festive) updateWifiLabel();
             sky.update();
             wallpaperPlayer.update();
+            if (prayerHome) {
+                if (prayerTimeline != null) prayerTimeline.refresh();
+                if (prayerData == null || System.currentTimeMillis() - prayerLoadedAt > 5 * MINUTE_MS) {
+                    loadPrayer(false);
+                }
+            }
             handler.postDelayed(this, MINUTE_MS);
+        }
+    };
+    /** Rotates the hadith/Quran quote on Home, every 30 seconds, only while the prayer strip is showing. */
+    private final Runnable quoteTick = new Runnable() {
+        @Override
+        public void run() {
+            if (prayerHome && prayerData != null && prayerData.quotes.size() > 1) {
+                quoteIndex = (quoteIndex + 1) % prayerData.quotes.size();
+                showQuote(false);
+            }
+            if (prayerHome) handler.postDelayed(this, 30_000L);
         }
     };
 
@@ -399,7 +429,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         openOnStartChoice = cfg.openOnStartChoice;
         liveTvAction = cfg.liveTvAction;
         liveTvInputId = cfg.liveTvInputId;
-        appLibraryEnabled = cfg.appLibrary;
+        appLibraryEnabled = cfg.appLibrary || cfg.libraryButton;
         tileMenuEnabled = cfg.tileMenu;
         inputAction = cfg.inputAction;
         inputUriScheme = cfg.inputUriScheme;
@@ -489,6 +519,34 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         vpnApp = cfg.vpnApp;
         moduleCards = cfg.moduleCards;
         hiddenApps = new HashSet<>(cfg.hiddenApps);
+
+        // WidgeTV-style prayer strip. The launcher has no INTERNET permission and never will: the
+        // Solat app fetches JAKIM/weather/quotes and exposes them through its local provider.
+        prayerHome = cfg.prayerHome;
+        if (prayerHome) {
+            prayerPanel = findViewById(R.id.prayerPanel);
+            prayerTimeline = findViewById(R.id.prayerTimeline);
+            prayerMeta = findViewById(R.id.prayerMeta);
+            prayerZone = findViewById(R.id.prayerZone);
+            quoteText = findViewById(R.id.quoteText);
+            quoteSource = findViewById(R.id.quoteSource);
+            // A layout without the strip (the Hebrew mirror until it is added) simply turns the feature off.
+            if (prayerPanel == null || prayerTimeline == null || prayerMeta == null
+                    || prayerZone == null || quoteText == null || quoteSource == null) {
+                prayerHome = false;
+            } else {
+                prayerPanel.setVisibility(View.GONE);
+                // The strip replaces the cinematic dock title in the same band.
+                hero.setVisibility(View.GONE);
+                // A soft shadow keeps plaster text readable over the gold side of the wallpaper.
+                int shadow = 0xB3000000;
+                prayerMeta.setShadowLayer(6 * density, 0, 2 * density, shadow);
+                prayerZone.setShadowLayer(6 * density, 0, 2 * density, shadow);
+                quoteText.setShadowLayer(8 * density, 0, 2 * density, shadow);
+                quoteSource.setShadowLayer(6 * density, 0, density, shadow);
+                prayerExecutor = Executors.newSingleThreadExecutor();
+            }
+        }
 
         grid = findViewById(R.id.grid);
         rtlAppGrid = getResources().getBoolean(R.bool.rtl_app_grid);
@@ -707,7 +765,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             onLibraryRequested();
             libraryFromTopBar = true;   // closing it goes back to this button, not to the pill after the last row
         });
-        btnLibraryTop.setVisibility(cfg.libraryButton && cfg.appLibrary ? View.VISIBLE : View.GONE);
+        btnLibraryTop.setVisibility(cfg.libraryButton ? View.VISIBLE : View.GONE);
         addTopBarApps(cfg.topBarApps);
         iconOnlyButtons = cfg.iconOnlyButtons;
         topMenu = cfg.topMenu;
@@ -954,6 +1012,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         sky.update();
         wallpaperPlayer.start();
         handler.postDelayed(minuteTick, MINUTE_MS);
+        if (prayerHome) {
+            loadPrayer(false);
+            handler.removeCallbacks(quoteTick);
+            handler.postDelayed(quoteTick, 30_000L);
+        }
         if (festive && diya != null) {
             diya.start();
             LocalDate today = LocalDate.now();
@@ -962,6 +1025,96 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 handler.postDelayed(this::playPetalShower, 450);
             }
         }
+    }
+
+    // ---- the WidgeTV prayer strip ------------------------------------------------------------
+
+    /**
+     * Reads the Solat app's local provider on a worker thread. The first query can spend a few seconds
+     * fetching the month/weather/quotes in the Solat process; after that its own cache makes it cheap.
+     * A missing Solat app simply leaves the strip hidden.
+     */
+    private void loadPrayer(boolean force) {
+        if (!prayerHome || !started || prayerExecutor == null || prayerExecutor.isShutdown() || prayerLoading) return;
+        long now = System.currentTimeMillis();
+        if (!force && prayerData != null && now - prayerLoadedAt < 5 * MINUTE_MS) return;
+        prayerLoading = true;
+        prayerExecutor.execute(() -> {
+            PrayerSource.Data data = PrayerSource.load(MainActivity.this);
+            runOnUiThread(() -> {
+                prayerLoading = false;
+                if (isFinishing() || isDestroyed()) return;
+                if (data == null) {
+                    if (prayerData == null) prayerPanel.setVisibility(View.GONE);
+                    handler.postDelayed(() -> loadPrayer(true), 60_000L);
+                    return;
+                }
+                prayerData = data;
+                prayerLoadedAt = now;
+                quoteIndex = 0;
+                bindPrayer();
+            });
+        });
+    }
+
+    private void bindPrayer() {
+        if (prayerData == null || prayerPanel == null) return;
+        prayerTimeline.setData(prayerData);
+        StringBuilder meta = new StringBuilder();
+        if (prayerData.hijri != null && !prayerData.hijri.isEmpty()) meta.append(prayerData.hijri);
+        if (prayerData.weatherNow != -999 && prayerData.weatherHigh != -999
+                && prayerData.weatherLow != -999) {
+            if (meta.length() > 0) meta.append("   ·   ");
+            meta.append(prayerData.weatherNow).append("°  ↑").append(prayerData.weatherHigh)
+                    .append("°  ↓").append(prayerData.weatherLow).append('°');
+        }
+        prayerMeta.setText(meta);
+        prayerMeta.setVisibility(meta.length() == 0 ? View.GONE : View.VISIBLE);
+        StringBuilder zone = new StringBuilder();
+        if (!prayerData.zone.isEmpty()) zone.append(prayerData.zone);
+        if (!prayerData.zoneLabel.isEmpty()) {
+            if (zone.length() > 0) zone.append("   ·   ");
+            zone.append(prayerData.zoneLabel);
+        }
+        if (!prayerData.timezone.isEmpty()) {
+            if (zone.length() > 0) zone.append("   ·   ");
+            zone.append(prayerData.timezone);
+        }
+        prayerZone.setText(zone);
+        prayerZone.setVisibility(zone.length() == 0 ? View.GONE : View.VISIBLE);
+        showQuote(true);
+        prayerPanel.setVisibility(View.VISIBLE);
+    }
+
+    /** Puts one quote on screen; a rotation cross-fades the text and its source. */
+    private void showQuote(boolean first) {
+        if (prayerData == null || quoteText == null) return;
+        if (prayerData.quotes.isEmpty()) {
+            quoteText.setVisibility(View.GONE);
+            quoteSource.setVisibility(View.GONE);
+            return;
+        }
+        quoteText.setVisibility(View.VISIBLE);
+        quoteSource.setVisibility(View.VISIBLE);
+        quoteIndex = Math.max(0, Math.min(quoteIndex, prayerData.quotes.size() - 1));
+        PrayerSource.Quote quote = prayerData.quotes.get(quoteIndex);
+        boolean instant = first || !animations || reducedMotion;
+        if (instant) {
+            quoteText.animate().cancel();
+            quoteText.setText(quote.text);
+            quoteText.setAlpha(1f);
+            quoteText.setTranslationY(0f);
+            quoteSource.setText(quote.source);
+            return;
+        }
+        final float lift = 4 * density;
+        quoteText.animate().cancel();
+        quoteText.animate().alpha(0f).translationY(-lift).setDuration(160).withEndAction(() -> {
+            quoteText.setText(quote.text);
+            quoteSource.setText(quote.source);
+            quoteText.setTranslationY(lift);
+            quoteText.animate().alpha(1f).translationY(0f).setDuration(360).start();
+        }).start();
     }
 
     /** Launcher settings' change count (Config.SETTINGS_REVISION_KEY); onResume rebuilds Home when it moved. */
@@ -1127,6 +1280,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         ambient.animate().cancel();
         heroArt.animate().cancel();
         handler.removeCallbacks(minuteTick);
+        handler.removeCallbacks(quoteTick);
         stopStats();
         if (diya != null) diya.stop();
         cancelPendingFocusScroll();
@@ -1181,6 +1335,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        handler.removeCallbacks(quoteTick);
+        if (prayerExecutor != null) prayerExecutor.shutdownNow();
         unregisterReceiver(packageReceiver);
         wallpaperPlayer.close();
         ConnectivityManager cm = getSystemService(ConnectivityManager.class);
@@ -1596,11 +1752,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         r.set(0, 0, card.getWidth(), card.getHeight());
         root.offsetDescendantRectToMyCoords(card, r);
         float pad = 6f * density;        // matches GlassView's glow inset
-        float scale = adapter.focusScale();
+        float scale = adapter.focusScale(position);
         float w = card.getWidth() * scale + 2 * pad;
         float h = card.getHeight() * scale + 2 * pad;
         float x = r.exactCenterX() - w / 2f;
-        float y = r.exactCenterY() - h / 2f - (advancedEffects ? 4f * density : 0f);
+        float lift = advancedEffects && !(dockRow && position < COLUMNS) ? 4f * density : 0f;
+        float y = r.exactCenterY() - h / 2f - lift;
 
         ViewGroup.LayoutParams lp = glass.getLayoutParams();
         if (lp.width != (int) w || lp.height != (int) h || card.getWidth() != glassCardW) {
@@ -1670,7 +1827,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         View card = vh == null ? null : vh.itemView.findViewById(R.id.card);
         if (card == null || card.getWidth() <= 0 || !card.isFocused()) return;
         float pad = 6f * density;
-        float scale = adapter.focusScale();
+        float scale = adapter.focusScale(pos);
         int w = (int) (card.getWidth() * scale + 2 * pad);
         int h = (int) (card.getHeight() * scale + 2 * pad);
         if (!glassShown || card.getWidth() != glassCardW || glass.getWidth() != w || glass.getHeight() != h) {
