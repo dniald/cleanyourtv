@@ -369,7 +369,7 @@
         <LinearLayout
             android:id="@+id/prayerPanel"
             android:layout_width="match_parent"
-            android:layout_height="250dp"
+            android:layout_height="270dp"
             android:layout_marginTop="10dp"
             android:orientation="vertical"
             android:gravity="center_horizontal"
@@ -386,7 +386,7 @@
                 android:singleLine="true"
                 android:ellipsize="end"
                 android:textColor="#9FB0CC"
-                android:textSize="11sp"
+                android:textSize="14sp"
                 android:includeFontPadding="false" />
 
             <com.gathin.tvhome.PrayerHomeView
@@ -400,7 +400,7 @@
                 android:id="@+id/prayerZone"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
+                android:layout_marginTop="5dp"
                 android:gravity="center"
                 android:singleLine="true"
                 android:ellipsize="end"
@@ -413,7 +413,7 @@
                 android:id="@+id/quoteText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="14dp"
+                android:layout_marginTop="60dp"
                 android:gravity="center"
                 android:maxLines="4"
                 android:ellipsize="end"
@@ -427,7 +427,7 @@
                 android:id="@+id/quoteSource"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
+                android:layout_marginTop="6dp"
                 android:gravity="center"
                 android:singleLine="true"
                 android:ellipsize="end"
