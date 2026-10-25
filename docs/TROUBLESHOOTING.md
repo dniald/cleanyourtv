@@ -336,7 +336,8 @@ Things that bit us or contributors, so they don't bite you. Commands use `tools/
   the first unlock, and only a direct-boot-aware activity can start then. Most firmwares have a
   `FallbackHome` that stands in until the unlock; some, like this CVTE board, do not, and then boot
   never completes. This repo's launcher is only partly direct-boot-aware: `HomeKeyService` declares
-  the flag, so Android binds it while the user is still locked, and `MainActivity`, the activity that
+  the flag, so Android binds it while the user is still locked, and `GuardRevival` declares it too
+  (nothing binds that listener unless the standby opt-in is turned on). `MainActivity`, the activity that
   answers HOME, does not declare it. The second command below therefore prints
   `PARTIALLY_DIRECT_BOOT_AWARE` for this launcher and cannot say whether Home exists before the
   unlock; on a set with no `FallbackHome`, the first command is the one that decides. Check both
@@ -421,7 +422,8 @@ Things that bit us or contributors, so they don't bite you. Commands use `tools/
   `SetupWraith|CastInfoProvider: querying cast infos` and `Created singleton instance of
   ClientAuthSigner`, and casting works. You cannot keep the provider and give up only Home:
   `pm disable-user` on `setupwraith/.RecoveryActivity` is refused with `SecurityException: Shell
-  cannot change component state`. So either debloat without setupwraith and launcherx, or re-enable
+  cannot change component state`. So either debloat without setupwraith and launcherx (for the 4K:
+  [`debloat-keep-cast.txt`](../examples/google-chromecast-gtv-4k/debloat-keep-cast.txt)), or re-enable
   setupwraith after each boot, wait for `ClientAuthSigner`, then disable it again: the receiver keeps
   the credentials in memory, so casting survives until the next reboot - and only in that process.
   `am force-stop com.google.android.apps.mediashell` followed by the receiver coming back prints
@@ -542,6 +544,17 @@ Things that bit us or contributors, so they don't bite you. Commands use `tools/
   cannot know about, so after a big update compare `tools/tv.py 'pm list packages'` with the list
   once by hand. On a TV whose list disables the updater, this only happens when you install an
   update on purpose: enable the updater, update, `check.py --fix`, disable it again.
+- **The TV opens Live TV by itself at every power-on**, often on a "please scan channels" screen, with
+  the new launcher already Home: seen on an ERGO DVB92YC (Changhong AI PONT, `redwood`, MT5867,
+  Android TV 14, `UKNV.260514.001`). `logcat -b events -d | grep wm_set_resumed_activity` after a
+  reboot shows `com.mediatek.wwtv.tvcenter/.nav.TurnkeyUiMainActivity` resumed about 12 s in, a
+  Homwee "hotel" `ProtocolActivity` on top, then Live TV again at about 25 s. It is started by
+  `com.mediatek.wwtv.tvcenter/.util.BootBroadcastReceiver` (BOOT_COMPLETED, priority 1000); on
+  Android 14 `pm disable` of that one component is refused for the shell, and neither the Live TV menu
+  nor Android's Settings has a power-on-input option. Disabling the whole Live TV app would cost the
+  HDMI inputs. Set `power_on_home` (`config.xml` or a theme) with `HOME_KEY_SERVICE=1`: until the first
+  key press after boot or screen-on, `HomeKeyService` sends that Live TV window back to Home. Ask the
+  person first; someone who watches broadcast TV may want the opposite, `boot_to_live_tv`.
 
 ## Accessibility helper enabled but the remote button does nothing
 
@@ -847,6 +860,33 @@ does this (`SoundbarWaker.java`). It is a trade-off: Network debugging stays on 
 the home network, which the PROMPT's last step closes on purpose; on a set with `ro.adb.secure=0` an open port is a shell for anyone on the network, so only consider it where the TV asks to allow each new key. On Sony, an app can instead open the
 Home Theatre Control panel (`com.sony.dtv.HomeTheatreControl`) for about half a second, which also
 wakes the soundbar and needs no ADB, at the cost of the panel flashing on screen.
+
+## Moonlight: two controllers both drive player 1, or a DualSense button opens the exit prompt
+
+With `HomeKeyService` bound (`HOME_KEY_SERVICE=1`) and filtering keys, Moonlight streaming from Sunshine on a
+TCL G07 (`G07_4K_GB_NF`, Android 11, `AR17`) with a DualSense (`054c:0ce6`) and an Xbox Wireless Controller
+(`045e:0b20`), both over Bluetooth, put both controllers on player 1, and Cross on the DualSense brought up
+Moonlight's exit prompt instead of pressing A. Both controllers were listed in `dumpsys input` as separate
+devices with sources `0x01000511`, so pairing was not the problem.
+
+The DualSense half has a known shape: Android 11 ships no key layout for it, so `dumpsys input` shows
+`KeyLayoutFile: /system/usr/keylayout/Generic.kl`, and `getevent -lp` shows the generic HID order
+(`BTN_GAMEPAD`, `BTN_EAST`, `BTN_C`, `BTN_NORTH`, ...). Cross is `BTN_EAST`, which `Generic.kl` maps to
+`BUTTON_B`, and an unhandled `BUTTON_B` falls back to Back. Moonlight has a scan-code remap for this layout
+(`isNonStandardDualShock4` in its `ControllerHandler`), but it did not take effect while the helper filtered keys,
+consistent with what `GamepadPassthrough` (#1118) describes: re-injected keys no longer read as the
+controller's own, so Moonlight could neither remap them nor tell the two controllers apart.
+
+`gamepad_passthrough` fixed both: Cross acts as A and the second controller joins as player 2. Set it in
+`config.xml` and rebuild, or `"gamepad_passthrough": true` in a theme's `config.json`. The trade is the
+one in [the key-repeat section above](#a-key-helper-is-bound-and-a-held-remote-button-stopped-repeating): the
+remote buttons the helper answers (gear, app buttons) do nothing while a controller is connected, and come back
+when it disconnects. To check what a controller reports:
+
+```sh
+tools/tv.py 'dumpsys input' | grep -E 'Controller|KeyLayoutFile|Sources'
+tools/tv.py 'getevent -lp'
+```
 
 ## One app refuses to play while the rest of the TV is online
 

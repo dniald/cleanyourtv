@@ -68,6 +68,8 @@
         <!-- Coocaa OS sources for the Inputs menu (coocaa_sources); see CoocaaSources. -->
         <provider android:authorities="com.skyworth.tv.provider" />
         <provider android:authorities="com.skyworth.tv.sdk.provider" />
+        <!-- The Solat app's local prayer/quote provider (config.xml prayer_home). No INTERNET here. -->
+        <provider android:authorities="com.gathin.tv.solat.provider" />
     </queries>
 
     <application
@@ -209,8 +211,42 @@
             android:exported="true"
             android:permission="android.permission.WRITE_SECURE_SETTINGS" />
 
+        <!-- Read-only wallpaper collection for the Solat screensaver, so the dream shows the same pictures
+             as Home instead of a copy. Exported without a permission on purpose (wallpapers are public theme
+             art), read-only, and it serves only files already in the collection. No INTERNET, no storage
+             permission. A fixed authority because the Solat app is a different package. See WallpaperProvider.
+             The ExportedContentProvider warning is expected: no writes and no data outside the collection. -->
+        <provider
+            android:name=".WallpaperProvider"
+            android:authorities="com.gathin.tvhome.wallpapers"
+            android:exported="true"
+            android:grantUriPermissions="false"
+            tools:ignore="ExportedContentProvider" />
+
         <!-- The remote's Input button (KEYCODE_TV or KEYCODE_TV_INPUT) opens the input switcher, and input_key_keycodes and
          app_keys (config.xml or a theme) bring back other remote buttons; see InputKeyService. -->
+        <!-- Bound again by the system after a force stop, which restarts Home on firmware that kills
+             third-party apps (TCL tc8000_ay30a2). It reads no notification.
+             cmd notification allow_listener com.gathin.tvhome/.GuardRevival -->
+        <service
+            android:name=".GuardRevival"
+            android:directBootAware="true"
+            android:exported="true"
+            android:label="@string/home_key_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+        <receiver
+            android:name=".GuardConfig"
+            android:exported="true"
+            android:permission="android.permission.WRITE_SECURE_SETTINGS">
+            <intent-filter>
+                <action android:name="com.gathin.tvhome.GUARD" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name=".InputKeyService"
             android:exported="false"

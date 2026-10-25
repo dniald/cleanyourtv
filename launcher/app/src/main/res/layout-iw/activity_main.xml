@@ -152,6 +152,7 @@
             android:visibility="gone" />
     </LinearLayout>
 
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -378,6 +379,78 @@
             </LinearLayout>
         </RelativeLayout>
 
+        <!-- WidgeTV-style prayer strip (config.xml / theme prayer_home); mirrors layout/activity_main.xml. -->
+        <LinearLayout
+            android:id="@+id/prayerPanel"
+            android:layout_width="match_parent"
+            android:layout_height="270dp"
+            android:layout_marginTop="10dp"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:focusable="false"
+            android:clickable="false"
+            android:importantForAccessibility="no"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/prayerMeta"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:singleLine="true"
+                android:ellipsize="end"
+                android:textColor="#9FB0CC"
+                android:textSize="14sp"
+                android:includeFontPadding="false" />
+
+            <com.gathin.tvhome.PrayerHomeView
+                android:id="@+id/prayerTimeline"
+                android:layout_width="match_parent"
+                android:layout_height="78dp"
+                android:layout_marginTop="4dp"
+                android:importantForAccessibility="no" />
+
+            <TextView
+                android:id="@+id/prayerZone"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="5dp"
+                android:gravity="center"
+                android:singleLine="true"
+                android:ellipsize="end"
+                android:textColor="#9FB0CC"
+                android:textSize="11sp"
+                android:letterSpacing="0.06"
+                android:includeFontPadding="false" />
+
+            <TextView
+                android:id="@+id/quoteText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="60dp"
+                android:gravity="center"
+                android:maxLines="4"
+                android:ellipsize="end"
+                android:textColor="#EFE7D6"
+                android:textSize="15sp"
+                android:fontFamily="serif"
+                android:textStyle="italic"
+                android:includeFontPadding="false" />
+
+            <TextView
+                android:id="@+id/quoteSource"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center"
+                android:singleLine="true"
+                android:ellipsize="end"
+                android:textColor="#D8B46A"
+                android:textSize="10sp"
+                android:textAllCaps="true"
+                android:includeFontPadding="false" />
+        </LinearLayout>
+
         <!-- The wrapper clips at the grid's edge; the grid itself must not clip so scaled tiles can overflow their cells. -->
         <FrameLayout
             android:layout_width="match_parent"
@@ -391,8 +464,8 @@
                 android:layout_height="match_parent"
                 android:paddingTop="10dp"
                 android:paddingBottom="40dp"
-                android:paddingStart="10dp"
-                android:paddingEnd="10dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
                 android:clipToPadding="false"
                 android:clipChildren="false"
                 android:overScrollMode="never"

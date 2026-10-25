@@ -90,6 +90,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * tvOS style home: black, a pinned dock row, an app grid, and one glass highlight that springs between tiles.
@@ -189,6 +191,19 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private TextView raceKicker, raceHeadline, raceSessions;
     /** config.xml show_stats, overridable by a theme. Off: the line is gone and nothing is read. */
     private boolean showStats;
+    /** config.xml / theme prayer_home: the WidgeTV prayer strip, fed by the Solat app's local provider. */
+    private boolean prayerHome;
+    private View prayerPanel;
+    private PrayerHomeView prayerTimeline;
+    private TextView prayerMeta, prayerZone, quoteText, quoteSource;
+    private PrayerSource.Data prayerData;
+    /** Which of the provider's quotes is on screen; the rotation moves it every 30 seconds. */
+    private int quoteIndex;
+    private boolean prayerLoading;
+    private long prayerLoadedAt;
+    private ExecutorService prayerExecutor;
+    /** Retries a failed provider read a minute later; cancelled with the other ticks when Home pauses. */
+    private final Runnable prayerRetry = () -> loadPrayer(true);
     private boolean shamsi;
     /** greeting_name: said after the greeting, which is shown in capitals. */
     private String greetingName = "";
@@ -283,6 +298,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private String dockEditAppKey;
     private AppLibraryDialog appLibrary;
     private boolean appLibrarySelection;
+    private boolean libraryOkOpens;
     private boolean libraryFocusPending;
     private RecyclerView.OnScrollListener pendingFocusScroll;
 
@@ -365,7 +381,24 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             if (festive) updateWifiLabel();
             sky.update();
             wallpaperPlayer.update();
+            if (prayerHome) {
+                if (prayerTimeline != null) prayerTimeline.refresh();
+                if (prayerData == null || System.currentTimeMillis() - prayerLoadedAt > 5 * MINUTE_MS) {
+                    loadPrayer(false);
+                }
+            }
             handler.postDelayed(this, MINUTE_MS);
+        }
+    };
+    /** Rotates the hadith/Quran quote on Home, every 30 seconds, only while the prayer strip is showing. */
+    private final Runnable quoteTick = new Runnable() {
+        @Override
+        public void run() {
+            if (prayerHome && prayerData != null && prayerData.quotes.size() > 1) {
+                quoteIndex = (quoteIndex + 1) % prayerData.quotes.size();
+                showQuote(false);
+            }
+            if (prayerHome) handler.postDelayed(this, 30_000L);
         }
     };
 
@@ -377,6 +410,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // config.xml, overlaid by config.json from a pushed theme (see Config and tools/theme.sh).
         Config cfg = Config.load(this);
         appLibrarySelection = cfg.appLibrarySelection;
+        libraryOkOpens = cfg.libraryOkOpens;
         // restore_key_services: after a force stop, put back the remote's accessibility helpers that Android took
         // off the list (needs WRITE_SECURE_SETTINGS, granted by build-and-install with RESTORE_KEY_SERVICES=1).
         if (cfg.restoreKeyServices) ServiceRepair.restore(this);
@@ -399,7 +433,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         openOnStartChoice = cfg.openOnStartChoice;
         liveTvAction = cfg.liveTvAction;
         liveTvInputId = cfg.liveTvInputId;
-        appLibraryEnabled = cfg.appLibrary;
+        appLibraryEnabled = cfg.appLibrary || cfg.libraryButton;
         tileMenuEnabled = cfg.tileMenu;
         inputAction = cfg.inputAction;
         inputUriScheme = cfg.inputUriScheme;
@@ -454,15 +488,20 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             findViewById(R.id.clockDivider).setBackgroundColor(Color.WHITE);
         }
         if (getResources().getBoolean(R.bool.rtl_menu_bar)) {
-            // Center Hebrew greetings over the numeric time, independent of a visible AM/PM label.
-            findViewById(R.id.clock).addOnLayoutChangeListener((v, l, t, right, bottom, ol, ot, or, ob) -> {
+            // Center Hebrew greetings over the numeric time, independent of a visible AM/PM label. The clock's row
+            // is watched too: date_below_clock can move the whole row right under a wider date.
+            View clock = findViewById(R.id.clock);
+            View clockRow = (View) clock.getParent();
+            View.OnLayoutChangeListener centerGreeting = (v, l, t, right, bottom, ol, ot, or, ob) -> {
                 ViewGroup.LayoutParams params = greeting.getLayoutParams();
-                if (params.width != right - l) {
-                    params.width = right - l;
+                if (params.width != clock.getWidth()) {
+                    params.width = clock.getWidth();
                     greeting.setLayoutParams(params);
                 }
-                greeting.setTranslationX(l);
-            });
+                greeting.setTranslationX(clockRow.getLeft() + clock.getLeft());
+            };
+            clock.addOnLayoutChangeListener(centerGreeting);
+            clockRow.addOnLayoutChangeListener(centerGreeting);
         }
         btnWifi = findViewById(R.id.btnWifi);
         shamsiDate = findViewById(R.id.shamsiDate);
@@ -479,6 +518,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         lunarOffset = Lunar.offsetFor(cfg.lunarUtcOffset, Locale.getDefault());
         if (lunar) lunarDate.setVisibility(View.VISIBLE);
         greetingName = cfg.greetingName;
+        if (cfg.dateBelowClock) moveDateBelowClock();
         if (shamsi) {
             shamsiDate.setVisibility(View.VISIBLE);
             TextView date = findViewById(R.id.date);
@@ -489,6 +529,34 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         vpnApp = cfg.vpnApp;
         moduleCards = cfg.moduleCards;
         hiddenApps = new HashSet<>(cfg.hiddenApps);
+
+        // WidgeTV-style prayer strip. The launcher has no INTERNET permission and never will: the
+        // Solat app fetches JAKIM/weather/quotes and exposes them through its local provider.
+        prayerHome = cfg.prayerHome;
+        if (prayerHome) {
+            prayerPanel = findViewById(R.id.prayerPanel);
+            prayerTimeline = findViewById(R.id.prayerTimeline);
+            prayerMeta = findViewById(R.id.prayerMeta);
+            prayerZone = findViewById(R.id.prayerZone);
+            quoteText = findViewById(R.id.quoteText);
+            quoteSource = findViewById(R.id.quoteSource);
+            // A layout without the strip (the Hebrew mirror until it is added) simply turns the feature off.
+            if (prayerPanel == null || prayerTimeline == null || prayerMeta == null
+                    || prayerZone == null || quoteText == null || quoteSource == null) {
+                prayerHome = false;
+            } else {
+                prayerPanel.setVisibility(View.GONE);
+                // The strip replaces the cinematic dock title in the same band.
+                hero.setVisibility(View.GONE);
+                // A soft shadow keeps plaster text readable over the gold side of the wallpaper.
+                int shadow = 0xB3000000;
+                prayerMeta.setShadowLayer(6 * density, 0, 2 * density, shadow);
+                prayerZone.setShadowLayer(6 * density, 0, 2 * density, shadow);
+                quoteText.setShadowLayer(8 * density, 0, 2 * density, shadow);
+                quoteSource.setShadowLayer(6 * density, 0, density, shadow);
+                prayerExecutor = Executors.newSingleThreadExecutor();
+            }
+        }
 
         grid = findViewById(R.id.grid);
         rtlAppGrid = getResources().getBoolean(R.bool.rtl_app_grid);
@@ -563,7 +631,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             public void onChildViewDetachedFromWindow(@NonNull View v) {
             }
         });
-        if (dockRow) grid.addItemDecoration(new DockDecoration(COLUMNS, density, cinematic, cfg.alwaysShowNames, cfg.dockOpacity, cfg.dockGlass, cfg.dockEvenPadding,
+        if (dockRow) grid.addItemDecoration(new DockDecoration(COLUMNS, density, cinematic, cfg.alwaysShowNames, cfg.dockOpacity, cfg.dockGlass, cfg.dockEvenPadding, cfg.dockBand,
                 singleRow, cfg.dockBandAll));
         if (cfg.fadeRows) TopFade.attach(grid, 48 * density);
         // Reduced motion: the tiles are simply there, with no entrance (reloadApps skips it there too).
@@ -707,7 +775,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             onLibraryRequested();
             libraryFromTopBar = true;   // closing it goes back to this button, not to the pill after the last row
         });
-        btnLibraryTop.setVisibility(cfg.libraryButton && cfg.appLibrary ? View.VISIBLE : View.GONE);
+        btnLibraryTop.setVisibility(cfg.libraryButton ? View.VISIBLE : View.GONE);
         addTopBarApps(cfg.topBarApps);
         iconOnlyButtons = cfg.iconOnlyButtons;
         topMenu = cfg.topMenu;
@@ -954,6 +1022,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         sky.update();
         wallpaperPlayer.start();
         handler.postDelayed(minuteTick, MINUTE_MS);
+        if (prayerHome) {
+            loadPrayer(false);
+            handler.removeCallbacks(quoteTick);
+            handler.postDelayed(quoteTick, 30_000L);
+        }
         if (festive && diya != null) {
             diya.start();
             LocalDate today = LocalDate.now();
@@ -962,6 +1035,97 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 handler.postDelayed(this::playPetalShower, 450);
             }
         }
+    }
+
+    // ---- the WidgeTV prayer strip ------------------------------------------------------------
+
+    /**
+     * Reads the Solat app's local provider on a worker thread. The first query can spend a few seconds
+     * fetching the month/weather/quotes in the Solat process; after that its own cache makes it cheap.
+     * A missing Solat app simply leaves the strip hidden.
+     */
+    private void loadPrayer(boolean force) {
+        if (!prayerHome || !started || prayerExecutor == null || prayerExecutor.isShutdown() || prayerLoading) return;
+        long now = System.currentTimeMillis();
+        if (!force && prayerData != null && now - prayerLoadedAt < 5 * MINUTE_MS) return;
+        prayerLoading = true;
+        prayerExecutor.execute(() -> {
+            PrayerSource.Data data = PrayerSource.load(MainActivity.this);
+            runOnUiThread(() -> {
+                prayerLoading = false;
+                if (isFinishing() || isDestroyed()) return;
+                if (data == null) {
+                    if (prayerData == null && prayerPanel != null) prayerPanel.setVisibility(View.GONE);
+                    handler.removeCallbacks(prayerRetry);
+                    handler.postDelayed(prayerRetry, 60_000L);
+                    return;
+                }
+                prayerData = data;
+                prayerLoadedAt = System.currentTimeMillis();
+                quoteIndex = 0;
+                bindPrayer();
+            });
+        });
+    }
+
+    private void bindPrayer() {
+        if (prayerData == null || prayerPanel == null) return;
+        prayerTimeline.setData(prayerData);
+        StringBuilder meta = new StringBuilder();
+        if (prayerData.hijri != null && !prayerData.hijri.isEmpty()) meta.append(prayerData.hijri);
+        if (prayerData.weatherNow != -999 && prayerData.weatherHigh != -999
+                && prayerData.weatherLow != -999) {
+            if (meta.length() > 0) meta.append("   ·   ");
+            meta.append(prayerData.weatherNow).append("°  ↑").append(prayerData.weatherHigh)
+                    .append("°  ↓").append(prayerData.weatherLow).append('°');
+        }
+        prayerMeta.setText(meta);
+        prayerMeta.setVisibility(meta.length() == 0 ? View.GONE : View.VISIBLE);
+        StringBuilder zone = new StringBuilder();
+        if (!prayerData.zone.isEmpty()) zone.append(prayerData.zone);
+        if (!prayerData.zoneLabel.isEmpty()) {
+            if (zone.length() > 0) zone.append("   ·   ");
+            zone.append(prayerData.zoneLabel);
+        }
+        if (!prayerData.timezone.isEmpty()) {
+            if (zone.length() > 0) zone.append("   ·   ");
+            zone.append(prayerData.timezone);
+        }
+        prayerZone.setText(zone);
+        prayerZone.setVisibility(zone.length() == 0 ? View.GONE : View.VISIBLE);
+        showQuote(true);
+        prayerPanel.setVisibility(View.VISIBLE);
+    }
+
+    /** Puts one quote on screen; a rotation cross-fades the text and its source. */
+    private void showQuote(boolean first) {
+        if (prayerData == null || quoteText == null) return;
+        if (prayerData.quotes.isEmpty()) {
+            quoteText.setVisibility(View.GONE);
+            quoteSource.setVisibility(View.GONE);
+            return;
+        }
+        quoteText.setVisibility(View.VISIBLE);
+        quoteSource.setVisibility(View.VISIBLE);
+        quoteIndex = Math.max(0, Math.min(quoteIndex, prayerData.quotes.size() - 1));
+        PrayerSource.Quote quote = prayerData.quotes.get(quoteIndex);
+        boolean instant = first || !animations || reducedMotion;
+        if (instant) {
+            quoteText.animate().cancel();
+            quoteText.setText(quote.text);
+            quoteText.setAlpha(1f);
+            quoteText.setTranslationY(0f);
+            quoteSource.setText(quote.source);
+            return;
+        }
+        final float lift = 4 * density;
+        quoteText.animate().cancel();
+        quoteText.animate().alpha(0f).translationY(-lift).setDuration(160).withEndAction(() -> {
+            quoteText.setText(quote.text);
+            quoteSource.setText(quote.source);
+            quoteText.setTranslationY(lift);
+            quoteText.animate().alpha(1f).translationY(0f).setDuration(360).start();
+        }).start();
     }
 
     /** Launcher settings' change count (Config.SETTINGS_REVISION_KEY); onResume rebuilds Home when it moved. */
@@ -1127,6 +1291,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         ambient.animate().cancel();
         heroArt.animate().cancel();
         handler.removeCallbacks(minuteTick);
+        handler.removeCallbacks(quoteTick);
+        handler.removeCallbacks(prayerRetry);
         stopStats();
         if (diya != null) diya.stop();
         cancelPendingFocusScroll();
@@ -1181,6 +1347,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        handler.removeCallbacks(quoteTick);
+        handler.removeCallbacks(prayerRetry);
+        if (prayerExecutor != null) prayerExecutor.shutdownNow();
         unregisterReceiver(packageReceiver);
         wallpaperPlayer.close();
         ConnectivityManager cm = getSystemService(ConnectivityManager.class);
@@ -1562,7 +1731,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (openPopup != null) openPopup.dismiss();
         libraryFocusPending = false;
         libraryFromTopBar = false;
-        appLibrary = new AppLibraryDialog(this, animations, reducedMotion, appLibrarySelection, adapter::containsPackage, () -> reloadApps(false), () -> {
+        appLibrary = new AppLibraryDialog(this, animations, reducedMotion, appLibrarySelection, libraryOkOpens, adapter::containsPackage, () -> reloadApps(false), () -> {
             appLibrary = null;
             openPopup = null;
             if (libraryFromTopBar) {
@@ -1596,11 +1765,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         r.set(0, 0, card.getWidth(), card.getHeight());
         root.offsetDescendantRectToMyCoords(card, r);
         float pad = 6f * density;        // matches GlassView's glow inset
-        float scale = adapter.focusScale();
+        float scale = adapter.focusScale(position);
         float w = card.getWidth() * scale + 2 * pad;
         float h = card.getHeight() * scale + 2 * pad;
         float x = r.exactCenterX() - w / 2f;
-        float y = r.exactCenterY() - h / 2f - (advancedEffects ? 4f * density : 0f);
+        float lift = advancedEffects && !(dockRow && position < COLUMNS) ? 4f * density : 0f;
+        float y = r.exactCenterY() - h / 2f - lift;
 
         ViewGroup.LayoutParams lp = glass.getLayoutParams();
         if (lp.width != (int) w || lp.height != (int) h || card.getWidth() != glassCardW) {
@@ -1670,7 +1840,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         View card = vh == null ? null : vh.itemView.findViewById(R.id.card);
         if (card == null || card.getWidth() <= 0 || !card.isFocused()) return;
         float pad = 6f * density;
-        float scale = adapter.focusScale();
+        float scale = adapter.focusScale(pos);
         int w = (int) (card.getWidth() * scale + 2 * pad);
         int h = (int) (card.getHeight() * scale + 2 * pad);
         if (!glassShown || card.getWidth() != glassCardW || glass.getWidth() != w || glass.getHeight() != h) {
@@ -2247,6 +2417,28 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         hideHero();
     }
 
+    /**
+     * date_below_clock: the date column moves to its own line under the clock, in the vertical LinearLayout that holds
+     * the clock's row, and the line between them goes. In Hebrew (rtl_menu_bar) the date and the clock's row sit right.
+     */
+    private void moveDateBelowClock() {
+        View column = (View) findViewById(R.id.date).getParent();
+        View clockRow = (View) findViewById(R.id.clock).getParent();
+        LinearLayout clockColumn = (LinearLayout) clockRow.getParent();
+        ((ViewGroup) column.getParent()).removeView(column);
+        findViewById(R.id.clockDivider).setVisibility(View.GONE);
+        // Its own width, not the column's: in Hebrew the column is only as wide as the clock.
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = Math.round(4 * density);
+        if (getResources().getBoolean(R.bool.rtl_menu_bar)) {
+            // Date and clock flush right; the greeting stays left and follows the clock by translation.
+            lp.gravity = Gravity.RIGHT;
+            ((LinearLayout.LayoutParams) clockRow.getLayoutParams()).gravity = Gravity.RIGHT;
+        }
+        clockColumn.addView(column, clockColumn.indexOfChild(clockRow) + 1, lp);
+    }
+
     /** The first top-bar button after Inputs that is shown, in bar order (top_bar_apps, the network pill, ...); Settings is always there. */
     private View firstTopButton() {
         ViewGroup bar = findViewById(R.id.topButtons);
@@ -2425,6 +2617,14 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             if (hour < 6) res = R.string.good_night;
             else if (hour < 12) res = R.string.good_morning;
             else if (hour < 21) res = R.string.good_afternoon;
+            else res = R.string.good_night;
+        } else if ("da".equals(lang)) {
+            // Danish day parts: "God morgen" until 11, then "God formiddag" to noon.
+            if (hour < 5) res = R.string.good_night;
+            else if (hour < 11) res = R.string.good_morning;
+            else if (hour < 12) res = R.string.good_forenoon;
+            else if (hour < 18) res = R.string.good_afternoon;
+            else if (hour < 22) res = R.string.good_evening;
             else res = R.string.good_night;
         } else {
             if (hour < 5) res = R.string.good_night;
@@ -2957,7 +3157,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 String label = l == null ? info.getId() : l.toString();
                 boolean hdmi = info.getType() == TvInputInfo.TYPE_HDMI;
                 if (hdmi && !label.toUpperCase(Locale.ROOT).contains("HDMI")) label = "HDMI " + label;
-                CharSequence custom = info.loadCustomLabel(this);
+                CharSequence custom = InputNames.tidy(info.loadCustomLabel(this));
                 boolean named = custom != null && custom.length() > 0 && !custom.toString().equals(label);
                 if (!hdmi && rows.getChildCount() > 0 && !sawNonHdmi) addSeparator(rows);
                 if (!hdmi) sawNonHdmi = true;
@@ -2967,7 +3167,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     // Settings > Inputs), then the port. Opening the device's input also makes it the CEC
                     // active source, which wakes it.
                     for (TvInputInfo device : devices) {
-                        CharSequence name = device.loadCustomLabel(this);
+                        CharSequence name = InputNames.tidy(device.loadCustomLabel(this));
                         if (name == null || name.length() == 0) name = named ? custom : device.loadLabel(this);
                         String deviceLabel = name == null || name.length() == 0 ? label : name + " \u00B7 " + label;
                         final String deviceId = device.getId();
